@@ -1,6 +1,6 @@
 # pi-storage-sqlite 移植注记
 
-对应上游：[`@earendil-works/pi-storage-sqlite-node`](https://github.com/earendil-works/pi/tree/main/packages/storage/sqlite-node)（v0.84.1）
+对应上游：[`@earendil-works/pi-storage-sqlite-node`](https://github.com/earendil-works/pi/tree/main/packages/storage/sqlite-node)（v0.85.1）
 
 ## 有意偏离上游
 
@@ -12,6 +12,13 @@
 ## cherry-pick
 
 （暂无）
+
+## v0.85.1 同步说明
+
+- 上游本轮 SQLite 改动位于 harness v3 session 存储（session-backends 迁回
+  agent 包内部、ownership 对齐 session workers）；本端 ``storage.py`` 为独立
+  精简实现，schema/查询结构不同，无映射的运行时变更。
+- 本包仅同步版本、上游引用与内部依赖约束（``>=0.85.1,<0.86``）。
 
 ## v0.84.1 同步说明（破例同步 patch）
 

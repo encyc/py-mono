@@ -1,6 +1,6 @@
 # pi-server 移植注记
 
-对应上游：[`@earendil-works/pi-server`](https://github.com/earendil-works/pi/tree/main/packages/server)（v0.84.1）
+对应上游：[`@earendil-works/pi-server`](https://github.com/earendil-works/pi/tree/main/packages/server)（v0.85.1）
 
 ## 有意偏离上游
 
@@ -14,6 +14,13 @@
 ## cherry-pick
 
 （暂无）
+
+## v0.85.1 同步说明
+
+- 上游本轮 server 改动（socket 派生自 service ID、session metadata、worker
+  协调）依赖未移植的 protocol/client/harness v3 体系，本端精简 RPC/supervisor
+  维持现状，无映射的运行时变更。
+- 本包仅同步版本、上游引用与内部依赖约束（``>=0.85.1,<0.86``）。
 
 ## v0.84.1 同步说明（破例同步 patch）
 
