@@ -303,3 +303,30 @@ def test_format_skill_invocation_with_instructions():
     skill = Skill(name="my", description="d", content="body", file_path="/p/SKILL.md")
     block = format_skill_invocation(skill, "extra instructions")
     assert "extra instructions" in block
+
+
+# ============================================================
+# v0.85.1: 根目录普通 .md 需带非空 description，否则静默跳过
+# ============================================================
+
+
+def test_root_md_without_description_silently_skipped(tmp_path):
+    """根目录普通 .md 缺 description：静默跳过，不产生诊断（v0.85.1）。"""
+    (tmp_path / "with-desc.md").write_text("---\nname: ok-skill\ndescription: d\n---\nbody")
+    (tmp_path / "no-desc.md").write_text("---\nname: bad-skill\n---\nbody")
+    (tmp_path / "plain.md").write_text("just markdown, no frontmatter")
+
+    result = load_skills_from_dir(tmp_path)
+
+    assert [s.name for s in result.skills] == ["ok-skill"]
+    assert result.diagnostics == []
+
+
+def test_skill_md_missing_description_still_reports(tmp_path):
+    """SKILL.md 缺 description：照常报诊断（声明技能不受静默跳过影响）。"""
+    (tmp_path / "SKILL.md").write_text("---\nname: root-skill\n---\nbody")
+
+    result = load_skills_from_dir(tmp_path)
+
+    assert result.skills == []
+    assert any("description is required" in d.message for d in result.diagnostics)

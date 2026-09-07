@@ -130,6 +130,11 @@ class BashTool:
 
         output = stdout_data.decode("utf-8", errors="replace") if stdout_data else ""
         exit_code = proc.returncode
+        # 对齐上游 v0.85.1：被信号杀死（如 OOM killer）的进程没有正常退出码，
+        # asyncio 以负数表示信号；映射为 shell 惯例的 128+信号号（如 SIGKILL=137），
+        # 避免调用方误判为成功。
+        if exit_code is not None and exit_code < 0:
+            exit_code = 128 + (-exit_code)
 
         # 截断（尾部保留）
         trunc = truncate_tail(output)

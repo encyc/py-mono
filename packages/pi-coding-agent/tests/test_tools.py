@@ -336,3 +336,17 @@ def test_truncate_line():
     result, trunc = truncate_line(long_str, 500)
     assert trunc
     assert "[truncated]" in result
+
+
+# ============================================================
+# v0.85.1: 信号杀死的进程映射为 128+signal 退出码
+# ============================================================
+
+
+async def test_bash_signal_exit_code_mapped():
+    """SIGKILL 杀死的命令映射为 137（shell 惯例 128+信号号），非零退出。"""
+    tools = create_coding_tools()
+    bash = next(t for t in tools if t.name == "bash")
+    result = await bash.execute("t1", {"command": "kill -9 $$"})
+    assert result.details["exit_code"] == 137
+    assert "exited with code 137" in result.content[0].text
