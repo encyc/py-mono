@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
+from dataclasses import replace
 from typing import Any
 
 from pi_ai import (
@@ -145,6 +146,7 @@ async def _run_agent_loop_continue(
 ) -> list[AgentMessage]:
     new_messages: list[AgentMessage] = []
     await _safe_emit(emit, AgentStartEvent())
+    await _safe_emit(emit, TurnStartEvent())
     await _run_loop(context, new_messages, config, cancel_event, emit, stream_fn)
     return new_messages
 
@@ -164,7 +166,7 @@ async def _run_loop(
 ) -> None:
     current_context = initial_context
     config = initial_config
-    first_turn = True
+    last_completed_turn: dict[str, Any] | None = None
     pending_messages: list[AgentMessage] = await _safe_drain(config.get_steering_messages)
 
     while True:
@@ -172,10 +174,31 @@ async def _run_loop(
 
         # 内层：tool calls + steering
         while has_more_tool_calls or pending_messages:
-            if not first_turn:
+            if last_completed_turn is not None:
+                # v0.85.1：prepare_next_turn 移到下一轮开始前（仅当循环继续时执行），
+                # 可替换 context/model/thinking level。准备可能是长操作（如压缩），
+                # 期间排队的 steering 在此补拉（仅当此前未拉到消息，避免单轮注入两条）。
+                if config.prepare_next_turn:
+                    snapshot = await _maybe_await(config.prepare_next_turn(last_completed_turn))
+                    if snapshot:
+                        next_context = snapshot.get("context")
+                        if next_context is not None:
+                            current_context = next_context
+                        next_model = snapshot.get("model")
+                        thinking_level = snapshot.get("thinkingLevel")
+                        if next_model is not None or thinking_level is not None:
+                            config = replace(
+                                config,
+                                model=next_model if next_model is not None else config.model,
+                                reasoning=(
+                                    None
+                                    if thinking_level == "off"
+                                    else thinking_level or config.reasoning
+                                ),
+                            )
+                if not pending_messages:
+                    pending_messages = await _safe_drain(config.get_steering_messages)
                 await _safe_emit(emit, TurnStartEvent())
-            else:
-                first_turn = False
 
             # 注入待处理消息（steering，在下一个 assistant 响应前）
             if pending_messages:
@@ -220,23 +243,24 @@ async def _run_loop(
 
             await _safe_emit(emit, TurnEndEvent(message=message, tool_results=tool_results))
 
+            # v0.85.1：记录已完成轮次上下文；should_stop_after_turn 先于
+            # prepare_next_turn 看到它（后者仅在循环继续时于下一轮开始前执行）。
+            last_completed_turn = {
+                "message": message,
+                "tool_results": tool_results,
+                "context": current_context,
+                "new_messages": new_messages,
+            }
+
             # 检查取消
             if cancel_event is not None and cancel_event.is_set():
                 await _safe_emit(emit, AgentEndEvent(messages=new_messages))
                 return
 
-            # should_stop_after_turn（对齐 v0.84.1）：本轮结束后询问是否提前终止
+            # should_stop_after_turn（对齐 v0.84.1 引入、v0.85.1 调整时序）：
+            # 本轮结束后询问是否提前终止
             if config.should_stop_after_turn:
-                stop = await _maybe_await(
-                    config.should_stop_after_turn(
-                        {
-                            "message": message,
-                            "tool_results": tool_results,
-                            "context": current_context,
-                            "new_messages": new_messages,
-                        }
-                    )
-                )
+                stop = await _maybe_await(config.should_stop_after_turn(last_completed_turn))
                 if stop:
                     await _safe_emit(emit, AgentEndEvent(messages=new_messages))
                     return
@@ -514,6 +538,22 @@ async def _execute_single(
                     return _make_result_msg(tool_call, result, is_error), bool(
                         before.get("terminate")
                     )
+
+            # v0.85.1：准备阶段（校验 + before 钩子）完成后若已被取消，不再执行
+            # 工具，产出 "Operation aborted" 错误结果（含并行批次内尚未轮到的调用）。
+            if cancel_event is not None and cancel_event.is_set():
+                result = _error_result("Operation aborted")
+                is_error = True
+                await _safe_emit(
+                    emit,
+                    ToolExecutionEndEvent(
+                        tool_call_id=tool_call.id,
+                        tool_name=tool_call.name,
+                        result=result,
+                        is_error=is_error,
+                    ),
+                )
+                return _make_result_msg(tool_call, result, is_error), False
 
             # 执行
             def on_update(partial: AgentToolResult) -> None:

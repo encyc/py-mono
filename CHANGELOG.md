@@ -6,6 +6,58 @@
 本项目在 `CHANGELOG.md` 中保留公共的、用户可见的变更记录。
 具体的提交记录参见 [GitHub Releases](https://github.com/earendil-works/pi-py/releases)。
 
+## 0.85.1 (2026-09-07)
+
+对齐上游 v0.85.1（minor 0.85 + patch 0.85.1）。
+
+### pi-ai
+
+- OpenAI-compatible 适配器支持 ``reasoning_details`` 结构化回放（OpenRouter 等）：
+  流式期间收集增量（连续同类合并、加密条目独立）且不发流式事件，块结束时一次性
+  序列化进 thinking 签名；多轮对话时回放为 assistant 消息的 ``reasoning_details``
+  字段（含遗留工具调用 ``thoughtSignature`` 加密条目的回退路径）。
+- ``compat.thinkingTokenBudgetField`` 泛化封顶 reasoning 的顶层字段名
+  （``thinking_budget`` Qwen/DashScope/SGLang、``thinking_budget_tokens`` llama.cpp）；
+  遗留布尔 ``supportsThinkingTokenBudget`` 等价于 ``thinking_token_budget``（vLLM）。
+- 新增 strict JSON Schema 转换：strict 工具发送 strict 化 schema（可选属性包
+  ``anyOf``+null、全部属性 required、``additionalProperties: false``）；schema
+  无法 strict 化时自动回退普通工具（``strict="require"`` 时报错）。
+- ``SimpleStreamOptions.toolChoice``（``"auto"/"none"``）：provider 中性的工具
+  选择，OpenAI 透传字符串、Anthropic 映射为 ``{"type": ...}``。
+- Anthropic 适配器支持 server-side fallback（``compat.allowedFallbackModels``）：
+  响应模型切换时按 fallback 本地费率计费，``fallback`` 声明块自动跳过。
+- Anthropic 适配器支持 mid-conversation effort
+  （``compat.supportsMidConvoEffort``）：adaptive thinking + 按轮 effort system
+  消息 + ``providerThinkingLevel`` 记录。
+- ``compat.vllmPriority`` 注入顶层 ``priority`` 请求字段（vLLM 调度优先级）。
+- usage 解析补顶层 ``cached_tokens`` 回退（Kimi）；retry 分类新增
+  ``exceeded request buffer limit while retrying upstream``；所有 provider 请求
+  统一携带 pi User-Agent。
+- 类型对齐：``AssistantMessage.providerThinkingLevel``/``endTurn``、
+  ``ToolCall.namespace``、``ToolChoice``/``ThinkingTokenBudgetField``。
+
+### pi-agent-core
+
+- ``prepare_next_turn`` 钩子正式接入 agent loop（v0.85.1 时机语义）：在
+  turn_end 后、下一轮 turn_start 前执行，仅当循环继续时调用，可替换
+  context/model/thinking level，并在准备后补拉 steering 消息。
+- 工具准备阶段完成后被取消的调用不再执行，产出 ``"Operation aborted"``
+  错误结果（覆盖并行批次内尚未轮到的调用）。
+- ``agent_loop_continue`` 路径补发首个 ``turn_start`` 事件。
+- skills：根目录普通 ``.md`` 文件必须带非空 ``description`` frontmatter 才算
+  技能，否则静默跳过。
+
+### pi-coding-agent
+
+- bash 工具：被信号杀死的进程映射为 ``128 + 信号号`` 退出码（如 SIGKILL →
+  137），不再暴露 asyncio 负值、避免误判为成功。
+
+### 其它
+
+- ``pi-storage-sqlite`` / ``pi-server``：上游本轮改动（harness v3 / durable
+  drive / 远程 worker 体系）不在本端精简实现范围内，仅同步版本与依赖约束。
+- 五个 Python 包统一升级到 0.85.1，内部依赖范围更新为 ``>=0.85.1,<0.86``。
+
 ## 0.84.1 (2026-08-12)
 
 对齐上游 v0.84.1（破例同步 patch：跨 minor 0.83→0.84 并叠加 0.84.1 patch）。

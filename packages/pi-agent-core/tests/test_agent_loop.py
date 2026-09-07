@@ -12,7 +12,7 @@ from pi_ai import (
     UserMessage,
     get_model,
 )
-from pi_ai.providers.faux import FauxScript, push_script
+from pi_ai.providers.faux import FauxScript, clear_scripts, push_script
 
 
 class _EchoTool:
@@ -304,3 +304,181 @@ def test_agent_reset_ok_when_idle():
     agent = Agent(AgentOptions())
     agent.reset()  # 不应抛错
     assert agent._active_run is None
+
+
+# ============================================================
+# v0.85.1: prepare_next_turn 时机 / 并行工具取消
+# ============================================================
+
+
+async def test_prepare_next_turn_runs_before_next_turn_start():
+    """prepare_next_turn 在 turn_end 后、下一轮 turn_start 前执行（仅当循环
+    继续时）；可替换 model/thinking level/context。"""
+    calls: list[tuple[str, str]] = []
+
+    push_script(FauxScript(tool_calls=[ToolCall(id="c1", name="echo", arguments={"text": "x"})]))
+    push_script(FauxScript(text="done"))
+
+    from pi_ai import get_model as _gm
+
+    def prepare_next_turn(ctx):
+        calls.append(("prepare", ctx["message"].stop_reason))
+        return {
+            "model": _gm("faux", "faux"),
+            "thinkingLevel": "high",
+        }
+
+    config = AgentLoopConfig(
+        model=_faux_model(),
+        tool_execution="parallel",
+        prepare_next_turn=prepare_next_turn,
+        get_steering_messages=lambda: [],
+    )
+    config.tools = None
+    ctx = AgentContext(system_prompt="", messages=[], tools=[_EchoTool()])
+
+    es = agent_loop([UserMessage(content="hi")], ctx, config)
+    events = await _collect(es)
+
+    types = [e.type for e in events]
+    turn_starts = [i for i, t in enumerate(types) if t == "turn_start"]
+    assert len(turn_starts) == 2  # 首轮 + 工具轮
+    # prepare 恰好执行一次（第二轮开始前），且看到上一轮的 stop_reason
+    assert calls == [("prepare", "toolUse")]
+    # prepare 在第二个 turn_start 之前发生（通过 calls 顺序与事件数无法直接断言，
+    # 但第二轮 turn_start 存在证明循环继续时才执行）
+    assert types[-1] == "agent_end"
+
+
+async def test_prepare_next_turn_not_called_when_loop_ends():
+    """循环终止轮（无工具调用）不再执行 prepare_next_turn。"""
+    calls: list[str] = []
+    push_script(FauxScript(text="done"))
+
+    config = AgentLoopConfig(
+        model=_faux_model(),
+        tool_execution="parallel",
+        prepare_next_turn=lambda ctx: calls.append("prepare") or None,
+    )
+    ctx = AgentContext(system_prompt="", messages=[], tools=None)
+
+    es = agent_loop([UserMessage(content="hi")], ctx, config)
+    await _collect(es)
+
+    assert calls == []
+
+
+async def test_prepare_next_turn_off_thinking_level():
+    """thinkingLevel="off" 清除 reasoning：第二轮 LLM 调用不再带 reasoning。"""
+    push_script(FauxScript(tool_calls=[ToolCall(id="c1", name="echo", arguments={"text": "x"})]))
+    push_script(FauxScript(text="done"))
+
+    from pi_ai.providers.faux import faux_api_provider
+
+    seen_reasoning: list = []
+    inner_stream = faux_api_provider.stream_simple
+
+    def capturing_stream_fn(model, context, options):
+        seen_reasoning.append(getattr(options, "reasoning", None) if options else None)
+        return inner_stream(model, context, options)
+
+    config = AgentLoopConfig(
+        model=_faux_model(),
+        tool_execution="parallel",
+        reasoning="high",
+        prepare_next_turn=lambda ctx: {"thinkingLevel": "off"},
+    )
+    ctx = AgentContext(system_prompt="", messages=[], tools=[_EchoTool()])
+    es = agent_loop([UserMessage(content="hi")], ctx, config, stream_fn=capturing_stream_fn)
+    await _collect(es)
+
+    assert seen_reasoning == ["high", None]
+
+
+async def test_steering_picked_up_after_prepare_next_turn():
+    """prepare_next_turn 执行期间排队的 steering 消息在下一轮注入前补拉。"""
+    push_script(FauxScript(tool_calls=[ToolCall(id="c1", name="echo", arguments={"text": "x"})]))
+    push_script(FauxScript(text="done"))
+
+    steering_queue: list = []
+
+    def get_steering_messages():
+        return [steering_queue.pop()] if steering_queue else []
+
+    def prepare_next_turn(ctx):
+        # 准备期间用户插入了 steering 消息
+        steering_queue.append(UserMessage(content="steered"))
+        return None
+
+    config = AgentLoopConfig(
+        model=_faux_model(),
+        tool_execution="parallel",
+        prepare_next_turn=prepare_next_turn,
+        get_steering_messages=get_steering_messages,
+    )
+    ctx = AgentContext(system_prompt="", messages=[], tools=[_EchoTool()])
+
+    es = agent_loop([UserMessage(content="hi")], ctx, config)
+    messages = await _collect_result(es)
+
+    # steering 消息被注入到最终消息列表
+    assert any(isinstance(m, UserMessage) and m.content == "steered" for m in messages)
+
+
+async def _collect_result(es):
+    """消费事件流并返回最终消息列表。"""
+    async for _ in es:
+        pass
+    return await es.result()
+
+
+async def test_parallel_tool_aborted_before_execution():
+    """v0.85.1：准备阶段后、执行前取消 → 工具不执行，产出 Operation aborted 错误。"""
+    import asyncio
+
+    push_script(
+        FauxScript(
+            tool_calls=[
+                ToolCall(id="c1", name="echo", arguments={"text": "x"}),
+            ]
+        )
+    )
+    push_script(FauxScript(text="done"))
+
+    executed: list[str] = []
+
+    class _SlowTool(_EchoTool):
+        async def execute(self, tool_call_id, params, cancel_event=None, on_update=None):
+            executed.append(tool_call_id)
+            return await super().execute(tool_call_id, params, cancel_event, on_update)
+
+    cancel_event = asyncio.Event()
+
+    # before 钩子期间触发取消 → 准备完成后不再执行
+    async def before_tool_call(ctx, cancel):
+        cancel_event.set()
+        return None
+
+    config = AgentLoopConfig(
+        model=_faux_model(),
+        tool_execution="parallel",
+        before_tool_call=before_tool_call,
+    )
+
+    es = agent_loop(
+        [UserMessage(content="hi")],
+        AgentContext(system_prompt="", messages=[], tools=[_SlowTool()]),
+        config,
+        cancel_event=cancel_event,
+    )
+    await _collect(es)
+    messages = await es.result()
+
+    assert executed == []  # 未执行
+    tool_results = [m for m in messages if isinstance(m, ToolResultMessage)]
+    assert len(tool_results) == 1
+    assert tool_results[0].is_error is True
+    assert "Operation aborted" in tool_results[0].content[0].text
+
+    # 取消后循环终止，第二个脚本未被消费；清空避免污染后续 faux 测试
+    clear_scripts()

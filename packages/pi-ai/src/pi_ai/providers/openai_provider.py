@@ -14,6 +14,8 @@ Chat Completions 协议（覆盖 OpenAI 及大量兼容厂商）。
 6. **终止判定**：``finish_reason`` 缺失默认视为异常；但对声明
    ``compat.supportsFinishReason=False`` 的兼容端点（不发 finish_reason），
    流结束时按内容推断 ``stop``/``toolUse``。
+7. **reasoning_details 是回放元数据**（v0.85.1）：流式期间只收集不发事件，
+   块结束时一次性序列化进 thinking 签名，多轮回放为 assistant 消息字段。
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from ..constrained_sampling import (
     append_grammar_tool_input_json_delta,
     create_grammar_tool_input_properties,
     get_grammar_tool_input,
+    get_json_schema_tool_parameters,
     resolve_grammar_constrained_sampling,
     resolve_json_schema_strict_sampling,
 )
@@ -59,12 +62,14 @@ from ..types import (
     StreamOptions,
     TextContent,
     ThinkingContent,
+    ThinkingTokenBudgetField,
     ToolCall,
     ToolResultMessage,
     Usage,
     UsageCost,
     UserMessage,
 )
+from ..user_agent import get_pi_user_agent
 
 #: 思考内容可能的字段名（不同厂商差异），第一个非空者胜出。
 _THINKING_FIELDS = ("reasoning_content", "reasoning", "reasoning_text")
@@ -97,6 +102,140 @@ _DEFAULT_THINKING_BUDGETS: dict[str, int] = {
 def _clamp_reasoning(level: str) -> str:
     """把 ``xhigh``/``max`` 折叠为 ``high``（预算表只覆盖到 high）。对应上游 ``clampReasoning``。"""
     return "high" if level in ("xhigh", "max") else level
+
+
+def _thinking_budget_for_level(reasoning_level: str, custom_budgets: dict[str, int] | None) -> int:
+    """按级别取 thinking token 预算（自定义覆盖默认）。对应上游 ``thinkingBudgetForLevel``。"""
+    budgets = {**_DEFAULT_THINKING_BUDGETS, **(custom_budgets or {})}
+    return budgets.get(_clamp_reasoning(reasoning_level), 0)
+
+
+def _clamp_thinking_budget_to_answer_room(thinking_budget: int, ceiling: int) -> int:
+    """封顶 thinking 预算，保证答案至少剩 ``_MIN_ANSWER_TOKENS``。
+
+    对应上游 ``clampThinkingBudgetToAnswerRoom``。
+    """
+    return min(thinking_budget, max(0, ceiling - _MIN_ANSWER_TOKENS))
+
+
+_THINKING_BUDGET_FIELDS: tuple[ThinkingTokenBudgetField, ...] = (
+    "thinking_token_budget",
+    "thinking_budget",
+    "thinking_budget_tokens",
+)
+
+
+def _resolve_thinking_token_budget_field(compat: dict[str, Any]) -> ThinkingTokenBudgetField | None:
+    """解析封顶 reasoning 的顶层字段名。
+
+    对应上游 ``resolveThinkingTokenBudgetField``：
+    ``compat.thinkingTokenBudgetField`` 优先，遗留布尔
+    ``compat.supportsThinkingTokenBudget`` 等价于 ``"thinking_token_budget"``（vLLM）。
+    """
+    field = compat.get("thinkingTokenBudgetField")
+    if isinstance(field, str) and field in _THINKING_BUDGET_FIELDS:
+        return field
+    if compat.get("supportsThinkingTokenBudget"):
+        return "thinking_token_budget"
+    return None
+
+
+# ============================================================
+# reasoning_details（OpenRouter 等的结构化 reasoning 回放）
+# ============================================================
+
+#: reasoning detail 的合法 type。对应上游 ``OpenAIReasoningDetail``。
+_REASONING_DETAIL_TYPES = ("reasoning.summary", "reasoning.encrypted", "reasoning.text")
+
+
+def _is_openai_reasoning_detail(detail: Any) -> bool:
+    """校验单个 reasoning detail 结构。"""
+    if not isinstance(detail, dict):
+        return False
+    dtype = detail.get("type")
+    if dtype not in _REASONING_DETAIL_TYPES:
+        return False
+    index = detail.get("index")
+    if not (
+        (detail.get("id") is None or isinstance(detail.get("id"), str))
+        and (detail.get("format") is None or isinstance(detail.get("format"), str))
+        and (index is None or (isinstance(index, (int, float)) and not isinstance(index, bool)))
+    ):
+        return False
+    if dtype == "reasoning.summary":
+        return isinstance(detail.get("summary"), str)
+    if dtype == "reasoning.encrypted":
+        return isinstance(detail.get("data"), str)
+    return isinstance(detail.get("text"), str) and (
+        detail.get("signature") is None or isinstance(detail.get("signature"), str)
+    )
+
+
+def parse_openai_reasoning_details(signature: str | None) -> list[dict[str, Any]] | None:
+    """从 thinking 块签名解析结构化 reasoning details。失败返回 None。"""
+    if not signature:
+        return None
+    try:
+        parsed = json.loads(signature)
+    except (ValueError, TypeError):
+        return None
+    if (
+        isinstance(parsed, list)
+        and len(parsed) > 0
+        and all(_is_openai_reasoning_detail(d) for d in parsed)
+    ):
+        return parsed
+    return None
+
+
+def parse_legacy_encrypted_reasoning_detail(signature: str | None) -> dict[str, Any] | None:
+    """从工具调用的 thought_signature 解析遗留的加密 reasoning detail。"""
+    if not signature:
+        return None
+    try:
+        parsed = json.loads(signature)
+    except (ValueError, TypeError):
+        return None
+    if (
+        isinstance(parsed, dict)
+        and parsed.get("type") == "reasoning.encrypted"
+        and isinstance(parsed.get("id"), str)
+        and len(parsed["id"]) > 0
+        and isinstance(parsed.get("data"), str)
+        and len(parsed["data"]) > 0
+    ):
+        return parsed
+    return None
+
+
+def _append_reasoning_detail(details: list[dict[str, Any]], detail: dict[str, Any]) -> None:
+    """合并连续的同类 reasoning 增量；加密条目保持独立。
+
+    公共字段仅在来源有值时回填（对应上游 ``??=``/``||=``，避免把 absent
+    键序列化为 null）。
+    """
+
+    def fill_missing(target: dict[str, Any], source: dict[str, Any]) -> None:
+        for key in ("id", "format", "index"):
+            if target.get(key) is None and source.get(key) is not None:
+                target[key] = source[key]
+
+    last = details[-1] if details else None
+    if detail["type"] == "reasoning.text" and last is not None and last["type"] == "reasoning.text":
+        last["text"] += detail["text"]
+        if detail.get("signature") and not last.get("signature"):
+            last["signature"] = detail["signature"]
+        fill_missing(last, detail)
+        return
+    if (
+        detail["type"] == "reasoning.summary"
+        and last is not None
+        and last["type"] == "reasoning.summary"
+    ):
+        last["summary"] += detail["summary"]
+        fill_missing(last, detail)
+        return
+    details.append(dict(detail))
 
 
 # ============================================================
@@ -154,7 +293,11 @@ def _parse_chunk_usage(raw: Any, model: Model) -> Usage:
     prompt_tokens = getattr(raw, "prompt_tokens", 0) or 0
     ptd = getattr(raw, "prompt_tokens_details", None)
     cached = getattr(ptd, "cached_tokens", None) if ptd else None
-    cache_read = (cached or getattr(raw, "prompt_cache_hit_tokens", 0) or 0) or 0
+    # 缓存读取命中的三种摆放：OpenAI/OpenRouter 用 prompt_tokens_details.cached_tokens，
+    # DeepSeek 用 prompt_cache_hit_tokens，Kimi 在最终 usage chunk 用顶层 cached_tokens。
+    cache_read = (
+        cached or getattr(raw, "prompt_cache_hit_tokens", 0) or getattr(raw, "cached_tokens", 0)
+    ) or 0
     cache_write = (getattr(ptd, "cache_write_tokens", 0) if ptd else 0) or 0
 
     # cached_tokens 是缓存"读取"命中，不减去；input 扣除缓存部分使恒等式成立
@@ -202,7 +345,8 @@ def _create_client(
     options_headers: dict[str, str | None] | None,
     http_client: Any = None,
 ) -> AsyncOpenAI:
-    headers: dict[str, Any] = dict(model.headers or {})
+    # 统一携带 pi User-Agent（对应上游 getPiUserAgent），可被 model/请求级 headers 覆盖
+    headers: dict[str, Any] = {"User-Agent": get_pi_user_agent(), **(model.headers or {})}
     if options_headers:
         headers.update(options_headers)
     return AsyncOpenAI(
@@ -246,9 +390,8 @@ def _convert_tools(
         function = {
             "name": tool.name,
             "description": tool.description,
-            "parameters": (
-                tool.to_json_schema() if hasattr(tool, "to_json_schema") else tool.parameters
-            ),
+            # strict 工具发送 strict 化后的 schema（v0.85.1）
+            "parameters": get_json_schema_tool_parameters(tool, strict),
         }
         if supports_strict_mode:
             function["strict"] = strict if strict is not None else False
@@ -287,38 +430,67 @@ def _convert_messages(
             # 故用 __dict__ 直取绕过，运行时类型仍由 isinstance 保证。
             text_parts: list[str] = []
             tool_calls: list[dict[str, Any]] = []
+            tool_call_blocks: list[ToolCall] = []
+            thinking_blocks: list[ThinkingContent] = []
             for block in msg.__dict__["content"]:
                 if isinstance(block, ToolCall):
-                    input_property = (grammar_tool_input_properties or {}).get(block.name)
-                    if input_property is not None:
-                        tool_calls.append(
-                            {
-                                "id": block.id,
-                                "type": "custom",
-                                "custom": {
-                                    "name": block.name,
-                                    "input": get_grammar_tool_input(
-                                        block.name, block.arguments, input_property
-                                    ),
-                                },
-                            }
-                        )
-                    else:
-                        tool_calls.append(
-                            {
-                                "id": block.id,
-                                "type": "function",
-                                "function": {
-                                    "name": block.name,
-                                    "arguments": json.dumps(block.arguments),
-                                },
-                            }
-                        )
+                    tool_call_blocks.append(block)
+                elif isinstance(block, ThinkingContent):
+                    thinking_blocks.append(block)
+                elif isinstance(block, TextContent):
+                    text_parts.append(block.text)
+            # reasoning 回放数据：优先 thinking 块签名里的结构化 details，
+            # 回退到遗留的工具调用 thoughtSignature 加密条目（v0.85.1）。
+            preserved_reasoning_details: list[dict[str, Any]] | None = None
+            for tb in thinking_blocks:
+                details = parse_openai_reasoning_details(tb.thinking_signature)
+                if details is not None:
+                    preserved_reasoning_details = details
+                    break
+            if preserved_reasoning_details is None:
+                legacy = [
+                    d
+                    for d in (
+                        parse_legacy_encrypted_reasoning_detail(tc.thought_signature)
+                        for tc in tool_call_blocks
+                    )
+                    if d is not None
+                ]
+                if legacy:
+                    preserved_reasoning_details = legacy
+            for tc in tool_call_blocks:
+                input_property = (grammar_tool_input_properties or {}).get(tc.name)
+                if input_property is not None:
+                    tool_calls.append(
+                        {
+                            "id": tc.id,
+                            "type": "custom",
+                            "custom": {
+                                "name": tc.name,
+                                "input": get_grammar_tool_input(
+                                    tc.name, tc.arguments, input_property
+                                ),
+                            },
+                        }
+                    )
+                else:
+                    tool_calls.append(
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.arguments),
+                            },
+                        }
+                    )
             entry: dict[str, Any] = {"role": "assistant"}
             if text_parts:
                 entry["content"] = "\n".join(text_parts)
             if tool_calls:
                 entry["tool_calls"] = tool_calls
+            if preserved_reasoning_details:
+                entry["reasoning_details"] = preserved_reasoning_details
             out.append(entry)
         elif isinstance(msg, ToolResultMessage):
             text = "\n".join(b.text for b in msg.content if b.type == "text")
@@ -393,6 +565,10 @@ def _run_openai_stream(
                 supports_strict_mode=compat.get("supportsStrictMode", True),
                 supports_openai_grammar_tools=compat.get("supportsOpenAIGrammarTools", False),
             )
+        # provider 中性的工具选择（v0.85.1）：OpenAI 直接透传字符串
+        tool_choice = getattr(options, "tool_choice", None) if options else None
+        if tool_choice is not None:
+            params["tool_choice"] = tool_choice
         if options and options.temperature is not None:
             params["temperature"] = options.temperature
         if options and options.max_tokens is not None:
@@ -401,19 +577,29 @@ def _run_openai_stream(
         if options and options.timeout_ms is not None:
             params["timeout"] = options.timeout_ms / 1000
 
-        # thinking_token_budget（vLLM 等）：推理与答案共享 max_tokens，不设上限时
-        # 一次推理密集的轮次可能耗尽整个响应、既无答案也无工具调用。
-        # 仅当 compat.supportsThinkingTokenBudget 为真时生效；与 thinkingFormat
-        # 无关（同一台服务器可同时服务 zai/qwen/chat-template 模型）。
+        # vLLM 调度优先级（v0.85.1）：顶层 priority 字段，仅在 compat 声明时发送
+        if compat.get("vllmPriority") is not None:
+            params["priority"] = compat["vllmPriority"]
+
+        # 封顶 reasoning 的顶层预算字段（vLLM/Qwen/SGLang/llama.cpp 等）：推理与
+        # 答案共享 max_tokens，不设上限时一次推理密集的轮次可能耗尽整个响应、
+        # 既无答案也无工具调用。与 thinkingFormat 无关（同一台服务器可同时服务
+        # zai/qwen/chat-template 模型）。
+        budget_field = _resolve_thinking_token_budget_field(compat)
         reasoning_effort = getattr(options, "reasoning", None) if options else None
-        if compat.get("supportsThinkingTokenBudget") and reasoning_effort and model.reasoning:
-            level = _clamp_reasoning(reasoning_effort)
-            custom = getattr(options, "thinking_budgets", None) or {}
-            budgets = {**_DEFAULT_THINKING_BUDGETS, **custom}
+        thinking_budget: int | None = None
+        if reasoning_effort and model.reasoning:
             ceiling = params.get("max_tokens") or model.max_tokens
-            budget = min(budgets.get(level, 0), max(0, ceiling - _MIN_ANSWER_TOKENS))
-            if budget > 0:
-                params["thinking_token_budget"] = budget
+            budget = _clamp_thinking_budget_to_answer_room(
+                _thinking_budget_for_level(
+                    reasoning_effort,
+                    getattr(options, "thinking_budgets", None) if options else None,
+                ),
+                ceiling,
+            )
+            thinking_budget = budget if budget > 0 else None
+        if budget_field and thinking_budget is not None:
+            params[budget_field] = thinking_budget
 
         # 泛型采样参数：放在具名字段之后，使自定义键覆盖它们（如 llama.cpp/vLLM/
         # SGLang 的 top_p/top_k/min_p/repetition_penalty）。模型级按 key 被请求级覆盖。
@@ -430,6 +616,25 @@ def _run_openai_stream(
         has_finish_reason = False
         tool_blocks_by_index: dict[int, _ToolCallBlock] = {}
         tool_blocks_by_id: dict[str, _ToolCallBlock] = {}
+
+        # reasoning_details 是回放元数据而非用户可见的流式增量（v0.85.1）：
+        # 流式期间保存在内存，块结束时一次性序列化进 thinking 签名。
+        streamed_reasoning_details: list[dict[str, Any]] | None = None
+
+        def ensure_thinking_block(initial: str = "") -> ThinkingContent:
+            """确保存在 thinking 块（reasoning_details 也需要一个宿主块）。"""
+            nonlocal thinking_block, thinking_content_idx
+            if thinking_block is None:
+                thinking_block = ThinkingContent(thinking=initial)
+                thinking_content_idx = len(output.content)
+                output.content.append(thinking_block)
+                es.push(ThinkingStartEvent(content_index=thinking_content_idx, partial=output))
+            return thinking_block
+
+        def apply_streamed_reasoning_details() -> None:
+            """把流式期间收集的 reasoning details 序列化进 thinking 签名。"""
+            if streamed_reasoning_details is not None and thinking_block is not None:
+                thinking_block.thinking_signature = json.dumps(streamed_reasoning_details)
 
         def ensure_tool_block(
             index: int | None,
@@ -513,16 +718,9 @@ def _run_openai_stream(
                 for field in _THINKING_FIELDS:
                     thinking_val = getattr(delta, field, None)
                     if thinking_val:
-                        if thinking_block is None:
-                            thinking_block = ThinkingContent(thinking="")
-                            thinking_content_idx = len(output.content)
-                            output.content.append(thinking_block)
-                            es.push(
-                                ThinkingStartEvent(
-                                    content_index=thinking_content_idx, partial=output
-                                )
-                            )
-                        thinking_block.thinking += thinking_val
+                        tb = ensure_thinking_block()
+                        tb.thinking += thinking_val
+                        assert thinking_content_idx is not None
                         es.push(
                             ThinkingDeltaEvent(
                                 content_index=thinking_content_idx,
@@ -531,6 +729,18 @@ def _run_openai_stream(
                             )
                         )
                         break
+
+                # 结构化 reasoning_details（OpenRouter 等按增量下发）：仅收集回放
+                # 数据，不发流式事件；连续同类增量合并，加密条目保持独立。
+                raw_details = getattr(delta, "reasoning_details", None)
+                if isinstance(raw_details, list):
+                    for detail in raw_details:
+                        if not _is_openai_reasoning_detail(detail):
+                            continue
+                        ensure_thinking_block()
+                        if streamed_reasoning_details is None:
+                            streamed_reasoning_details = []
+                        _append_reasoning_detail(streamed_reasoning_details, detail)
 
                 # 工具调用增量（双索引 + 字符串累加 + 每增量重新解析）
                 tool_calls_delta = getattr(delta, "tool_calls", None)
@@ -592,6 +802,7 @@ def _run_openai_stream(
                     )
                 )
             if thinking_block is not None and thinking_content_idx is not None:
+                apply_streamed_reasoning_details()
                 es.push(
                     ThinkingEndEvent(
                         content_index=thinking_content_idx,
@@ -645,6 +856,7 @@ def _run_openai_stream(
             es.end(output)
 
         except BaseException as exc:  # noqa: BLE001
+            apply_streamed_reasoning_details()
             output.stop_reason = "error"
             output.error_message = _format_error(exc)
             es.push(ErrorEvent(reason="error", error=output))

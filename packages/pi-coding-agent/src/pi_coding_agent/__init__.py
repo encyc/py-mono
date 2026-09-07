@@ -12,8 +12,8 @@
 
 from __future__ import annotations
 
-__version__ = "0.84.1"
-__upstream_ref__ = "earendil-works/pi@v0.84.1"
+__version__ = "0.85.1"
+__upstream_ref__ = "earendil-works/pi@v0.85.1"
 
 # ---- 工具 ----
 # ---- SDK 入口 ----

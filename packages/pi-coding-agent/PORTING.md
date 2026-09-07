@@ -1,6 +1,6 @@
 # pi-coding-agent 移植注记
 
-对应上游：[`@earendil-works/pi-coding-agent`](https://github.com/earendil-works/pi/tree/main/packages/coding-agent)（v0.84.1）
+对应上游：[`@earendil-works/pi-coding-agent`](https://github.com/earendil-works/pi/tree/main/packages/coding-agent)（v0.85.1）
 
 ## 有意偏离上游（重要：本包大幅裁剪）
 
@@ -21,6 +21,14 @@
 ## cherry-pick
 
 （暂无）
+
+## v0.85.1 同步说明
+
+- bash 工具：被信号杀死的进程映射为 shell 惯例退出码 ``128 + 信号号``（如
+  SIGKILL → 137），不再以 asyncio 的负值暴露、避免误判为成功。
+- 上游本轮 core 改动（subagent session config 继承、可配置默认工具、远程
+  plugin/worker 体系、模型目录刷新）位于本端裁剪的 CLI/TUI/扩展/目录范围。
+- 本包仅同步版本、上游引用与内部依赖约束（``>=0.85.1,<0.86``）。
 
 ## v0.84.1 同步说明（破例同步 patch）
 

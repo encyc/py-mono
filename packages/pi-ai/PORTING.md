@@ -1,6 +1,6 @@
 # pi-ai 移植注记
 
-对应上游：[`@earendil-works/pi-ai`](https://github.com/earendil-works/pi/tree/main/packages/ai)（v0.84.1）
+对应上游：[`@earendil-works/pi-ai`](https://github.com/earendil-works/pi/tree/main/packages/ai)（v0.85.1）
 
 ## 进度
 
@@ -47,6 +47,47 @@
 ## cherry-pick
 
 （暂无）
+
+## v0.85.1 同步说明
+
+- **reasoning_details 结构化回放**（OpenRouter 等）：流式 ``delta.reasoning_details``
+  （``reasoning.summary`` / ``reasoning.encrypted`` / ``reasoning.text``）按增量收集、
+  连续同类合并、加密条目独立，**不发流式事件**；块结束时一次性序列化进
+  ``ThinkingContent.thinkingSignature``（错误路径同样补写）。消息回放时优先取
+  thinking 签名中的结构化 details，回退到遗留的工具调用 ``thoughtSignature`` 加密
+  条目，作为 assistant 消息的 ``reasoning_details`` 字段发送。
+- **thinkingTokenBudgetField 泛化**：``compat.thinkingTokenBudgetField`` 指定封顶
+  字段名（``thinking_budget`` Qwen/DashScope/SGLang、``thinking_budget_tokens``
+  llama.cpp），遗留布尔 ``supportsThinkingTokenBudget`` 等价于 ``thinking_token_budget``。
+- **strict JSON Schema 转换**：新增 ``make_strict_json_schema``（可选属性包
+  ``anyOf``+null、required 收拢为全部属性、``additionalProperties: false``）；
+  strict 工具发送转换后的 schema，schema 无法 strict 化时回退普通工具
+  （``strict="require"`` 除外，此时报错）。
+- **SimpleStreamOptions.toolChoice**（``"auto"/"none"``，provider 中性）：OpenAI
+  适配器透传字符串，Anthropic 适配器映射为 ``{"type": ...}``。
+- **Anthropic server-side fallback**：``compat.allowedFallbackModels`` 经请求体
+  ``fallbacks``（extra_body）声明；``message_start`` 的响应模型切换时计费改用
+  fallback 本地费率；``fallback`` 声明块跳过（出现在输出中间时报错）。
+- **Anthropic mid-conversation effort**（``compat.supportsMidConvoEffort``）：adaptive
+  thinking + ``block_binding.prefix_mismatch_behavior="drop_block"``，effort 通过
+  system 消息按轮切换（历史轮取 ``providerThinkingLevel``，末尾追加当前 effort），
+  ``output_config={"effort": "high"}``，且不发送 temperature；相关 beta 经 extra_body
+  ``betas`` 发送（SDK 未类型化该字段）。
+- **AssistantMessage.providerThinkingLevel / endTurn**、**ToolCall.namespace**：仅类型
+  对齐（endTurn/namespace 由未移植的 Responses/Codex 适配器产生）。
+- **vllmPriority**：``compat.vllmPriority`` 注入顶层 ``priority`` 请求字段。
+- OpenAI-compatible usage 解析补顶层 ``cached_tokens`` 回退（Kimi）。
+- 所有 provider 请求统一携带 ``User-Agent: pi (<platform> <release>; <arch>)``
+  （``pi_ai.get_pi_user_agent``）。
+- retry 分类新增 ``exceeded request buffer limit while retrying upstream``。
+- **未移植**（裁剪范围）：Google/Bedrock/Mistral/Codex/Responses 等适配器的本轮
+  变更、动态模型目录与 ``models.generated``、OAuth（Copilot/Kimi 登录流程）、
+  ``assistant-message-frame.ts``（harness v3 的帧 reducer）、``utils/validation.ts``
+  的 optional-null 归一化（本端未移植 typebox 校验）、``detectCompat`` 的 baseUrl
+  探测（含 DeepSeek 大小写不敏感检测与 max_tokens 切换）、Anthropic
+  ``input_transformations`` 诊断与 ``claude-code`` stealth UA（本端无 OAuth 模式）。
+  另注：anthropic SDK 0.117.1 尚不能解析 ``fallback`` 内容块事件，启用
+  server-side fallback 需升级 SDK。
 
 ## v0.84.1 同步说明（破例同步 patch）
 

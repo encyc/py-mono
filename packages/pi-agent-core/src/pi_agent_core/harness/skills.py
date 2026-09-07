@@ -131,8 +131,15 @@ def validate_description(description: str | None) -> list[str]:
 # ============================================================
 
 
-def load_skill_from_file(file_path: str | Path) -> tuple[Skill | None, list[SkillDiagnostic]]:
-    """从单个文件加载技能。返回 (skill|None, diagnostics)。"""
+def load_skill_from_file(
+    file_path: str | Path, *, is_declared_skill: bool = True
+) -> tuple[Skill | None, list[SkillDiagnostic]]:
+    """从单个文件加载技能。返回 (skill|None, diagnostics)。
+
+    ``is_declared_skill``：文件名是否为 ``SKILL.md``。普通根目录 ``.md`` 文件
+    （对齐上游 v0.85.1）必须带非空 ``description`` frontmatter 才算技能，
+    否则静默跳过且不产生诊断；``SKILL.md`` 的解析/校验失败照常报诊断。
+    """
     path = str(file_path)
     diagnostics: list[SkillDiagnostic] = []
     try:
@@ -143,6 +150,8 @@ def load_skill_from_file(file_path: str | Path) -> tuple[Skill | None, list[Skil
 
     fm, body = parse_frontmatter(text)
     description = fm.get("description")
+    if not is_declared_skill and (not isinstance(description, str) or not description.strip()):
+        return None, diagnostics
     name = fm.get("name") or Path(path).parent.name
 
     if not isinstance(name, str):
@@ -228,7 +237,8 @@ def _load_dir_recursive(
         if entry.is_dir():
             _load_dir_recursive(entry, root, include_root_files=False, result=result)
         elif include_root_files and name.endswith(".md"):
-            skill, diags = load_skill_from_file(entry)
+            # 根目录普通 .md：非声明技能，缺 description 时静默跳过（v0.85.1）
+            skill, diags = load_skill_from_file(entry, is_declared_skill=False)
             result.diagnostics.extend(diags)
             if skill:
                 result.skills.append(skill)
