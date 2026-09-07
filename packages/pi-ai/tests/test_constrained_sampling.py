@@ -82,3 +82,113 @@ def test_grammar_tool_input_delta_forms_valid_incremental_json():
 
     assert first == '{"query":"SELECT \\"a'
     assert second == '\\""}'
+
+
+# ============================================================
+# v0.85.1: strict JSON Schema 转换
+# ============================================================
+
+
+def _strict_tool(parameters, strict="prefer"):
+    return Tool(
+        name="t",
+        description="test",
+        parameters=parameters,
+        constrained_sampling={"type": "json_schema", "strict": strict},
+    )
+
+
+def test_make_strict_json_schema_marks_all_properties_required():
+    """可选属性包成 anyOf+null，required 收拢为全部属性，additionalProperties 关闭。"""
+    schema = {
+        "type": "object",
+        "properties": {
+            "a": {"type": "string"},
+            "b": {"type": "integer"},
+        },
+        "required": ["a"],
+    }
+
+    from pi_ai.constrained_sampling import make_strict_json_schema
+
+    result = make_strict_json_schema(schema)
+
+    assert result["required"] == ["a", "b"]
+    assert result["additionalProperties"] is False
+    assert result["properties"]["a"] == {"type": "string"}
+    assert result["properties"]["b"] == {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+    # 原 schema 不被修改
+    assert schema["required"] == ["a"]
+
+
+def test_make_strict_json_schema_allows_null_optional_property():
+    """已允许 null 的可选属性不重复包裹。"""
+    from pi_ai.constrained_sampling import make_strict_json_schema
+
+    result = make_strict_json_schema(
+        {
+            "type": "object",
+            "properties": {"a": {"type": ["string", "null"]}},
+        }
+    )
+
+    assert result["properties"]["a"] == {"type": ["string", "null"]}
+
+
+def test_make_strict_json_schema_rejects_unsupported_constructs():
+    from pi_ai.constrained_sampling import (
+        UnsupportedStrictJsonSchemaError,
+        make_strict_json_schema,
+    )
+
+    for bad in (
+        {"type": "object", "$ref": "#/x"},  # $ref
+        {"type": "object", "oneOf": []},  # oneOf
+        {"type": "object", "properties": {"a": {"allOf": []}}},  # 嵌套 allOf
+        {"type": "array", "items": [{"type": "string"}]},  # 元组 items
+        {"type": "object", "properties": None},  # properties 非映射
+        {"type": "string"},  # 根非 object
+    ):
+        with pytest.raises(UnsupportedStrictJsonSchemaError):
+            make_strict_json_schema(bad)
+
+
+def test_make_strict_json_schema_rejects_object_anyof_variant():
+    """anyOf 变体里不允许对象/数组型 schema。"""
+    from pi_ai.constrained_sampling import (
+        UnsupportedStrictJsonSchemaError,
+        make_strict_json_schema,
+    )
+
+    with pytest.raises(UnsupportedStrictJsonSchemaError):
+        make_strict_json_schema(
+            {
+                "type": "object",
+                "properties": {
+                    "a": {"anyOf": [{"type": "object", "properties": {}}, {"type": "string"}]},
+                },
+            }
+        )
+
+
+def test_strict_sampling_falls_back_when_schema_not_strictable():
+    """strict=prefer 且 schema 无法 strict 化：回退为普通工具（返回 None）。"""
+    tool = _strict_tool({"type": "object", "properties": {"a": {"$ref": "#/x"}}})
+
+    assert resolve_json_schema_strict_sampling(tool, True) is None
+
+
+def test_strict_sampling_require_errors_when_schema_not_strictable():
+    """strict=require 且 schema 无法 strict 化：报错。"""
+    tool = _strict_tool({"type": "object", "properties": {"a": {"oneOf": []}}}, strict="require")
+
+    with pytest.raises(ValueError, match="requires JSON-schema constrained sampling"):
+        resolve_json_schema_strict_sampling(tool, True)
+
+
+def test_strict_sampling_supported_schema_still_strict():
+    tool = _strict_tool(
+        {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}
+    )
+
+    assert resolve_json_schema_strict_sampling(tool, True) is True

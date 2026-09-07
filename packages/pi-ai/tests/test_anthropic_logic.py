@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from pi_ai import (
     AssistantMessage,
     Context,
@@ -62,14 +64,14 @@ def _budget_model() -> Model:
 def test_system_prompt_separate():
     """system prompt 作为独立参数（非 message）。"""
     ctx = Context(system_prompt="You are helpful.", messages=[UserMessage(content="hi")])
-    messages, system = _convert_messages(ctx)
+    messages, system, _ = _convert_messages(ctx)
     assert system == [{"type": "text", "text": "You are helpful."}]
     assert messages == [{"role": "user", "content": "hi"}]
 
 
 def test_no_system():
     ctx = Context(messages=[UserMessage(content="hi")])
-    _, system = _convert_messages(ctx)
+    _, system, _ = _convert_messages(ctx)
     assert system is None
 
 
@@ -85,7 +87,7 @@ def test_user_message_blocks():
             )
         ]
     )
-    messages, _ = _convert_messages(ctx)
+    messages, _, _ = _convert_messages(ctx)
     assert messages[0]["role"] == "user"
     content = messages[0]["content"]
     assert content[0] == {"type": "text", "text": "look"}
@@ -108,7 +110,7 @@ def test_assistant_thinking_with_signature():
             )
         ]
     )
-    messages, _ = _convert_messages(ctx)
+    messages, _, _ = _convert_messages(ctx)
     content = messages[0]["content"]
     assert content[0] == {"type": "thinking", "thinking": "hmm", "signature": "sig123"}
     assert content[1] == {"type": "text", "text": "answer"}
@@ -129,7 +131,7 @@ def test_assistant_tool_use():
             )
         ]
     )
-    messages, _ = _convert_messages(ctx)
+    messages, _, _ = _convert_messages(ctx)
     content = messages[0]["content"]
     assert content[1] == {
         "type": "tool_use",
@@ -162,7 +164,7 @@ def test_consecutive_tool_results_merged():
             ),
         ]
     )
-    messages, _ = _convert_messages(ctx)
+    messages, _, _ = _convert_messages(ctx)
     # assistant 消息 + 一个 user 消息（含两个 tool_result）
     assert len(messages) == 2
     assert messages[1]["role"] == "user"
@@ -429,3 +431,248 @@ async def test_anthropic_preserves_initial_thinking_block_content(monkeypatch):
     thinking = message.content[0]
     assert thinking.thinking == "hmm more"
     assert thinking.thinking_signature == "sig0"
+
+
+# ============================================================
+# v0.85.1: mid-conversation effort / server-side fallback / toolChoice
+# ============================================================
+
+
+def _capturing_anthropic_client(events, capture):
+    """假 Anthropic client，捕获 create() 的请求参数（含 extra_body）。"""
+
+    async def create(**kwargs):
+        capture.update(kwargs)
+        return _AnthropicAsyncItems(events)
+
+    return SimpleNamespace(messages=SimpleNamespace(create=create))
+
+
+def _mid_convo_model() -> Model:
+    model = _adaptive_model()
+    model.compat = {"supportsMidConvoEffort": True}
+    return model
+
+
+async def test_anthropic_mid_convo_effort_messages_and_params(monkeypatch):
+    """supportsMidConvoEffort：effort system 消息按轮插入，thinking 走
+    adaptive + block_binding，betas 经 extra_body 发送。"""
+    capture: dict = {}
+    events = [
+        SimpleNamespace(
+            type="message_start",
+            message=SimpleNamespace(id="m1", model="claude-sonnet-4-5", usage=None),
+        ),
+        SimpleNamespace(
+            type="message_delta",
+            delta=SimpleNamespace(stop_reason="end_turn"),
+            usage=None,
+        ),
+        SimpleNamespace(type="message_stop"),
+    ]
+    monkeypatch.setattr(
+        anthropic_provider,
+        "_create_client",
+        lambda model, api_key, headers, http_client=None: _capturing_anthropic_client(
+            events, capture
+        ),
+    )
+
+    from pi_ai import AssistantMessage, TextContent
+
+    context = Context(
+        messages=[
+            UserMessage(content="hi"),
+            AssistantMessage(
+                api="anthropic-messages",
+                provider="anthropic",
+                model="claude-sonnet-4-5",
+                stop_reason="stop",
+                provider_thinking_level="low",
+                content=[TextContent(text="hello")],
+            ),
+            UserMessage(content="again"),
+        ]
+    )
+    event_stream = anthropic_provider._run_anthropic_stream(
+        _mid_convo_model(),
+        context,
+        StreamOptions(api_key="test", temperature=0.7),
+    )
+    async for _ in event_stream:
+        pass
+    message = await event_stream.result()
+
+    messages = capture["messages"]
+    # 历史 assistant 前插 system effort=low，末尾追加当前 effort（默认 high）
+    assert messages[1] == {"role": "system", "content": [], "output_config": {"effort": "low"}}
+    assert messages[2]["role"] == "assistant"
+    assert messages[-1] == {"role": "system", "content": [], "output_config": {"effort": "high"}}
+
+    assert capture["output_config"] == {"effort": "high"}
+    assert "temperature" not in capture  # mid-convo effort 模型不支持 temperature
+
+    extra_body = capture["extra_body"]
+    assert "mid-conversation-output-config-2026-07-01" in extra_body["betas"]
+    assert "thinking-binding-controls-2026-08-01" in extra_body["betas"]
+    assert extra_body["thinking"]["type"] == "adaptive"
+    assert extra_body["thinking"]["block_binding"] == {"prefix_mismatch_behavior": "drop_block"}
+
+    # providerThinkingLevel 记录在响应上
+    assert message.provider_thinking_level == "high"
+
+
+async def test_anthropic_fallback_usage_and_blocks(monkeypatch):
+    """server-side fallback：fallbacks/betas 经 extra_body 发送；响应模型切换时
+    计费按 fallback 费率；fallback 声明块被跳过。"""
+    capture: dict = {}
+
+    def _usage(**kw):
+        base = {
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        }
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    events = [
+        SimpleNamespace(
+            type="message_start",
+            message=SimpleNamespace(
+                id="m1",
+                model="claude-backup",
+                usage=_usage(input_tokens=10, output_tokens=5),
+            ),
+        ),
+        SimpleNamespace(
+            type="content_block_start",
+            index=0,
+            content_block=SimpleNamespace(type="fallback"),
+        ),
+        SimpleNamespace(
+            type="content_block_start",
+            index=1,
+            content_block=SimpleNamespace(type="text", text=""),
+        ),
+        SimpleNamespace(type="content_block_stop", index=1),
+        SimpleNamespace(
+            type="message_delta",
+            delta=SimpleNamespace(stop_reason="end_turn"),
+            usage=_usage(output_tokens=6),
+        ),
+        SimpleNamespace(type="message_stop"),
+    ]
+    monkeypatch.setattr(
+        anthropic_provider,
+        "_create_client",
+        lambda model, api_key, headers, http_client=None: _capturing_anthropic_client(
+            events, capture
+        ),
+    )
+    model = _adaptive_model()
+    model.compat = {
+        "allowedFallbackModels": [
+            {
+                "provider": "anthropic",
+                "model": "claude-backup",
+                "cost": {"input": 1, "output": 2, "cacheRead": 0.5, "cacheWrite": 1},
+            }
+        ]
+    }
+
+    event_stream = anthropic_provider._run_anthropic_stream(
+        model, Context(messages=[UserMessage(content="hi")]), StreamOptions(api_key="test")
+    )
+    async for _ in event_stream:
+        pass
+    message = await event_stream.result()
+
+    extra_body = capture["extra_body"]
+    assert extra_body["fallbacks"] == [{"model": "claude-backup"}]
+    assert "server-side-fallback-2026-07-01" in extra_body["betas"]
+
+    # 响应模型切换为 fallback 模型，计费按 fallback 费率
+    assert message.model == "claude-backup"
+    assert message.usage.input == 10
+    assert message.usage.output == 6
+    assert message.usage.cost.input == pytest.approx(10 * 1 / 1_000_000)
+    assert message.usage.cost.output == pytest.approx(6 * 2 / 1_000_000)
+    # fallback 声明块不进 content
+    assert len(message.content) == 1
+    assert message.content[0].type == "text"
+
+
+async def test_anthropic_mid_output_fallback_rejected(monkeypatch):
+    """fallback 声明块出现在输出中间：报错。"""
+    events = [
+        SimpleNamespace(
+            type="message_start",
+            message=SimpleNamespace(id="m1", model="claude-sonnet-4-5", usage=None),
+        ),
+        SimpleNamespace(
+            type="content_block_start",
+            index=0,
+            content_block=SimpleNamespace(type="text", text="hi"),
+        ),
+        SimpleNamespace(
+            type="content_block_start",
+            index=1,
+            content_block=SimpleNamespace(type="fallback"),
+        ),
+    ]
+    monkeypatch.setattr(
+        anthropic_provider,
+        "_create_client",
+        lambda model, api_key, headers, http_client=None: _capturing_anthropic_client(events, {}),
+    )
+    model = _adaptive_model()
+    model.compat = {"allowedFallbackModels": [{"model": "x", "provider": "anthropic", "cost": {}}]}
+
+    event_stream = anthropic_provider._run_anthropic_stream(
+        model, Context(messages=[UserMessage(content="hi")]), StreamOptions(api_key="test")
+    )
+    async for _ in event_stream:
+        pass
+    message = await event_stream.result()
+
+    assert message.stop_reason == "error"
+    assert "mid-output model fallback" in (message.error_message or "")
+
+
+async def test_anthropic_tool_choice_forwarded(monkeypatch):
+    """SimpleStreamOptions.tool_choice 映射为 anthropic tool_choice 对象。"""
+    capture: dict = {}
+    events = [
+        SimpleNamespace(
+            type="message_start",
+            message=SimpleNamespace(id="m1", model="m", usage=None),
+        ),
+        SimpleNamespace(
+            type="message_delta",
+            delta=SimpleNamespace(stop_reason="end_turn"),
+            usage=None,
+        ),
+        SimpleNamespace(type="message_stop"),
+    ]
+    monkeypatch.setattr(
+        anthropic_provider,
+        "_create_client",
+        lambda model, api_key, headers, http_client=None: _capturing_anthropic_client(
+            events, capture
+        ),
+    )
+
+    from pi_ai import SimpleStreamOptions
+
+    event_stream = anthropic_provider._run_anthropic_stream(
+        _budget_model(),
+        Context(messages=[UserMessage(content="hi")]),
+        SimpleStreamOptions(api_key="test", tool_choice="none"),
+    )
+    async for _ in event_stream:
+        pass
+    await event_stream.result()
+
+    assert capture["tool_choice"] == {"type": "none"}

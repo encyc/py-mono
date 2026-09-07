@@ -13,6 +13,9 @@ Python SDK 原生暴露类型化事件）。
 4. **block 索引映射**：Anthropic 的 ``event.index`` ≠ pi 的 contentIndex，需按 index 查找。
 5. **usage 双点提取**：message_start 拿初始值，message_delta 仅在 ``!= null`` 时更新。
 6. **错误编码为事件**，``max_retries=0``。
+7. **beta 能力走请求体**（v0.85.1）：server-side fallback 与 mid-conversation
+   effort 的 ``betas``/``fallbacks``/``block_binding`` 字段经 ``extra_body``
+   发送（SDK 尚未类型化）；响应模型切换时计费按 fallback 本地费率。
 """
 
 from __future__ import annotations
@@ -23,7 +26,10 @@ from typing import Any
 
 from anthropic import AsyncAnthropic
 
-from ..constrained_sampling import resolve_json_schema_strict_sampling
+from ..constrained_sampling import (
+    get_json_schema_tool_parameters,
+    resolve_json_schema_strict_sampling,
+)
 from ..event_stream import EventStream
 from ..events import (
     AssistantMessageEvent,
@@ -45,6 +51,7 @@ from ..types import (
     AssistantMessage,
     Context,
     Model,
+    ModelCost,
     SimpleStreamOptions,
     StreamOptions,
     TextContent,
@@ -53,6 +60,7 @@ from ..types import (
     Usage,
     UsageCost,
 )
+from ..user_agent import get_pi_user_agent
 
 #: Anthropic stop_reason -> pi StopReason 映射。
 _STOP_REASON_MAP: dict[str, str] = {
@@ -64,6 +72,15 @@ _STOP_REASON_MAP: dict[str, str] = {
     "refusal": "error",
     "sensitive": "error",
 }
+
+#: beta 功能名（v0.85.1 起作为请求体 ``betas`` 字段发送）。
+#: 对应上游 anthropic-messages.ts 的 beta 常量。
+_SERVER_SIDE_FALLBACK_BETA = "server-side-fallback-2026-07-01"
+_MID_CONVERSATION_OUTPUT_CONFIG_BETA = "mid-conversation-output-config-2026-07-01"
+_THINKING_BINDING_CONTROLS_BETA = "thinking-binding-controls-2026-08-01"
+
+#: 合法的 Anthropic effort 值。对应上游 ``AnthropicEffort``。
+_ANTHROPIC_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
 # ============================================================
@@ -77,7 +94,8 @@ def _create_client(
     options_headers: dict[str, str | None] | None,
     http_client: Any = None,
 ) -> AsyncAnthropic:
-    headers: dict[str, str] = dict(model.headers or {})
+    # 统一携带 pi User-Agent（对应上游 getPiUserAgent），可被 model/请求级 headers 覆盖
+    headers: dict[str, str] = {"User-Agent": get_pi_user_agent(), **(model.headers or {})}
     if options_headers:
         for k, v in options_headers.items():
             if v is not None:
@@ -113,8 +131,9 @@ def _convert_tools(
     """ToolDef -> Anthropic tools 格式。input_schema 始终含 type/properties/required。"""
     out: list[dict[str, Any]] = []
     for tool in tools:
-        schema = tool.to_json_schema() if hasattr(tool, "to_json_schema") else tool.parameters
         strict = resolve_json_schema_strict_sampling(tool, supports_strict_tools)
+        # strict 工具发送 strict 化后的 schema（v0.85.1）
+        schema = get_json_schema_tool_parameters(tool, strict)
         legacy_schema = {
             "type": "object",
             "properties": schema.get("properties", {}),
@@ -131,11 +150,16 @@ def _convert_tools(
     return out
 
 
-def _convert_messages(context: Context) -> tuple[list[dict[str, Any]], Any]:
-    """Context -> (anthropic messages, system)。
+def _convert_messages(
+    context: Context, managed_provider: str | None = None
+) -> tuple[list[dict[str, Any]], Any, dict[int, str]]:
+    """Context -> (anthropic messages, system, assistant_levels)。
 
     system 为 list[{type:text, text, cache_control?}] 或 None。
     连续 toolResult 消息合并进一个 user 轮次。
+    assistant_levels 记录（转换后消息索引 -> 历史 effort 级别），仅当
+    ``managed_provider`` 匹配消息的 provider 且带 providerThinkingLevel 时
+    （v0.85.1 mid-conversation effort 回放）。
     """
     from ..types import AssistantMessage, ToolResultMessage, UserMessage
 
@@ -144,6 +168,7 @@ def _convert_messages(context: Context) -> tuple[list[dict[str, Any]], Any]:
         system = [{"type": "text", "text": context.system_prompt}]
 
     messages: list[dict[str, Any]] = []
+    assistant_levels: dict[int, str] = {}
     msgs = context.messages
     i = 0
     while i < len(msgs):
@@ -202,7 +227,15 @@ def _convert_messages(context: Context) -> tuple[list[dict[str, Any]], Any]:
                         }
                     )
             if parts:
+                message_index = len(messages)
                 messages.append({"role": "assistant", "content": parts})
+                if (
+                    managed_provider is not None
+                    and msg.api == "anthropic-messages"
+                    and msg.provider == managed_provider
+                    and msg.provider_thinking_level in _ANTHROPIC_EFFORTS
+                ):
+                    assistant_levels[message_index] = msg.provider_thinking_level
         elif isinstance(msg, ToolResultMessage):
             # 连续 toolResult 合并进一个 user 轮次
             tool_results: list[dict[str, Any]] = []
@@ -238,7 +271,22 @@ def _convert_messages(context: Context) -> tuple[list[dict[str, Any]], Any]:
             continue  # i 已在内部推进
         i += 1
 
-    return messages, system
+    return messages, system, assistant_levels
+
+
+def _insert_thinking_level_messages(
+    messages: list[dict[str, Any]], assistant_levels: dict[int, str], active_effort: str
+) -> list[dict[str, Any]]:
+    """mid-conversation effort：在带历史级别的 assistant 消息前插入 effort
+    system 消息，并在末尾追加当前 effort（v0.85.1）。"""
+    out: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        historical = assistant_levels.get(index)
+        if historical is not None:
+            out.append({"role": "system", "content": [], "output_config": {"effort": historical}})
+        out.append(message)
+    out.append({"role": "system", "content": [], "output_config": {"effort": active_effort}})
+    return out
 
 
 # ============================================================
@@ -387,6 +435,14 @@ def _run_anthropic_stream(
     api_key = (options.api_key if options else None) or _resolve_api_key()
 
     async def drive() -> None:
+        compat = model.compat or {}
+        # mid-conversation effort（v0.85.1）：托管 effort 模型始终用 adaptive
+        # thinking，effort 通过 system 消息按轮切换，并记录 providerThinkingLevel。
+        mid_convo = compat.get("supportsMidConvoEffort") is True
+        active_effort = (getattr(options, "effort", None) if options else None) or "high"
+        if active_effort not in _ANTHROPIC_EFFORTS:
+            active_effort = "high"
+
         output = AssistantMessage(
             api=model.api,
             provider=model.provider,
@@ -394,6 +450,8 @@ def _run_anthropic_stream(
             stop_reason="pending",
             timestamp=int(time.time() * 1000),
         )
+        if mid_convo:
+            output.provider_thinking_level = active_effort
         client = _create_client(
             model,
             api_key,
@@ -401,7 +459,27 @@ def _run_anthropic_stream(
             options.http_client if options else None,
         )
 
-        messages, system = _convert_messages(context)
+        messages, system, assistant_levels = _convert_messages(
+            context, managed_provider=model.provider if mid_convo else None
+        )
+        if mid_convo:
+            messages = _insert_thinking_level_messages(messages, assistant_levels, active_effort)
+
+        # 请求体级 beta 功能与新字段经 extra_body 发送（对应上游 ``betas``/``fallbacks``
+        # 请求体字段；SDK 尚未类型化）。
+        extra_body: dict[str, Any] = {}
+        betas: list[str] = []
+        if mid_convo:
+            betas.extend([_MID_CONVERSATION_OUTPUT_CONFIG_BETA, _THINKING_BINDING_CONTROLS_BETA])
+        allowed_fallback_models = compat.get("allowedFallbackModels")
+        if isinstance(allowed_fallback_models, list) and allowed_fallback_models:
+            betas.append(_SERVER_SIDE_FALLBACK_BETA)
+            extra_body["fallbacks"] = [
+                {"model": fb["model"]} for fb in allowed_fallback_models if isinstance(fb, dict)
+            ]
+        if betas:
+            extra_body["betas"] = list(dict.fromkeys(betas))
+
         params: dict[str, Any] = {
             "model": model.id,
             "messages": messages,
@@ -416,26 +494,46 @@ def _run_anthropic_stream(
         if context.tools:
             params["tools"] = _convert_tools(
                 context.tools,
-                supports_strict_tools=(model.compat or {}).get("supportsStrictTools", False),
+                supports_strict_tools=compat.get("supportsStrictTools", False),
             )
-        if options and options.temperature is not None:
+        # provider 中性的工具选择（v0.85.1）：映射为 anthropic tool_choice 对象
+        tool_choice = getattr(options, "tool_choice", None) if options else None
+        if tool_choice is not None:
+            params["tool_choice"] = {"type": tool_choice}
+        # temperature 与扩展 thinking 不兼容，mid-convo effort 模型也不支持
+        if options and options.temperature is not None and not mid_convo:
             params["temperature"] = options.temperature
         if options and options.timeout_ms is not None:
             params["timeout"] = options.timeout_ms / 1000
 
-        thinking_cfg = _build_thinking_config(model, options)
-        if thinking_cfg is not None:
-            params["thinking"] = thinking_cfg
+        if mid_convo:
+            # 托管 effort 模型：adaptive thinking，前缀不匹配的 thinking 块按服务端
+            # 语义丢弃（block_binding 尚未类型化，经 extra_body 发送）。
+            display = getattr(options, "thinking_display", None) if options else None
+            extra_body["thinking"] = {
+                "type": "adaptive",
+                "display": display or "summarized",
+                "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+            }
+            params["output_config"] = {"effort": "high"}
+        else:
+            thinking_cfg = _build_thinking_config(model, options)
+            if thinking_cfg is not None:
+                params["thinking"] = thinking_cfg
 
         # block 状态：anthropic_index -> _Block
         blocks: dict[int, _Block] = {}
+
+        # server-side fallback（v0.85.1）：响应模型可能不同于请求模型，
+        # 计费需按 fallback 模型的本地费率。
+        usage_model = model
 
         def find_block_by_anthropic_idx(idx: int) -> _Block | None:
             return blocks.get(idx)
 
         try:
             response = await retry_provider_request(
-                lambda: client.messages.create(**params),
+                lambda: client.messages.create(**params, extra_body=extra_body or None),
                 max_retries=(options.max_retries or 0) if options else 0,
                 max_retry_delay_ms=options.max_retry_delay_ms if options else None,
                 cancel_event=options.cancel_event if options else None,
@@ -448,9 +546,34 @@ def _run_anthropic_stream(
                     msg_obj = getattr(event, "message", None)
                     if msg_obj is not None:
                         output.response_id = getattr(msg_obj, "id", None)
+                        # 响应模型可能因 server-side fallback 与请求不同；
+                        # 计费改用 fallback 的本地费率（v0.85.1）。
+                        response_model = getattr(msg_obj, "model", None)
+                        if response_model:
+                            output.model = response_model
+                            if response_model != model.id and isinstance(
+                                allowed_fallback_models, list
+                            ):
+                                fallback_cost = next(
+                                    (
+                                        fb.get("cost")
+                                        for fb in allowed_fallback_models
+                                        if isinstance(fb, dict)
+                                        and fb.get("model") == response_model
+                                        and fb.get("provider") == model.provider
+                                    ),
+                                    None,
+                                )
+                                if isinstance(fallback_cost, dict):
+                                    usage_model = model.model_copy(
+                                        update={
+                                            "id": response_model,
+                                            "cost": ModelCost(**fallback_cost),
+                                        }
+                                    )
                         usage_obj = getattr(msg_obj, "usage", None)
                         if usage_obj is not None:
-                            output.usage = _update_usage_from_start(usage_obj, model)
+                            output.usage = _update_usage_from_start(usage_obj, usage_model)
                     es.push(StartEvent(partial=output.model_copy(deep=True)))
 
                 elif etype == "content_block_start":
@@ -458,6 +581,13 @@ def _run_anthropic_stream(
                     aidx = getattr(event, "index", 0)
                     cidx = len(output.content)
                     bt = getattr(cb, "type", None) if cb else None
+                    if bt == "fallback":
+                        # server-side fallback 的声明块：仅允许出现在输出开头
+                        if output.content:
+                            raise RuntimeError(
+                                "Anthropic performed an unsupported mid-output model fallback"
+                            )
+                        continue
                     # blk 在各 elif 分支复用；声明为 Optional 以兼容后续分支的查找赋值
                     blk: _Block | None = None
                     if bt == "text":
@@ -580,7 +710,7 @@ def _run_anthropic_stream(
                             if mapped == "error":
                                 output.error_message = f"Unhandled stop_reason: {stop_reason}"
                     if usage_delta is not None:
-                        _update_usage_from_delta(output.usage, usage_delta, model)
+                        _update_usage_from_delta(output.usage, usage_delta, usage_model)
 
                 elif etype == "message_stop":
                     pass  # 流结束，在循环外终止
@@ -649,8 +779,6 @@ anthropic_api_provider: Any = _AnthropicProvider()
 # ============================================================
 # 内置 Claude 模型（精简）
 # ============================================================
-
-from ..types import ModelCost  # noqa: E402
 
 ANTHROPIC_MODELS: list[Model] = [
     Model(

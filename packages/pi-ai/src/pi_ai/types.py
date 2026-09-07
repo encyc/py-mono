@@ -87,6 +87,18 @@ ThinkingLevel = Literal["minimal", "low", "medium", "high", "xhigh", "max"]
 #: 思考级别（含 off）。对应上游 ``ModelThinkingLevel``。
 ModelThinkingLevel = Literal["off", "minimal", "low", "medium", "high", "xhigh", "max"]
 
+#: provider 中性的工具选择（简单请求）。对应上游 ``ToolChoice``。
+#: 省略时各适配器使用 provider 私有行为。
+ToolChoice = Literal["auto", "none"]
+
+#: OpenAI-compatible 服务器上封顶 reasoning token 的顶层请求字段名。
+#: 对应上游 ``ThinkingTokenBudgetField``：
+#: ``thinking_token_budget``（vLLM）/ ``thinking_budget``（Qwen/DashScope/SGLang）/
+#: ``thinking_budget_tokens``（llama.cpp）。
+ThinkingTokenBudgetField = Literal[
+    "thinking_token_budget", "thinking_budget", "thinking_budget_tokens"
+]
+
 #: 缓存保留期。
 CacheRetention = Literal["none", "short", "long"]
 
@@ -123,7 +135,8 @@ class ThinkingContent(BaseModel):
 
     type: Literal["thinking"] = "thinking"
     thinking: str
-    #: provider 私有签名（如 OpenAI reasoning item ID）。
+    #: provider 私有的不透明签名或序列化的 reasoning 回放数据
+    #: （如 OpenAI reasoning item ID / reasoning_details JSON）。
     thinking_signature: str | None = Field(default=None, alias="thinkingSignature")
     #: 为 True 时真实载荷在 thinking_signature 里。
     redacted: bool = False
@@ -150,6 +163,9 @@ class ToolCall(BaseModel):
     arguments: dict[str, Any] = Field(default_factory=dict)
     #: Google 特有的思考签名。
     thought_signature: str | None = Field(default=None, alias="thoughtSignature")
+    #: OpenAI Responses 的命名空间（动态加载/命名空间工具调用）。仅类型对齐，
+    #: 本端未实现 Responses API。
+    namespace: str | None = None
 
 
 #: 助手消息允许的内容块联合（无图像）。
@@ -237,11 +253,17 @@ class AssistantMessage(BaseModel):
     model: str = ""
     response_model: str | None = Field(default=None, alias="responseModel")
     response_id: str | None = Field(default=None, alias="responseId")
+    #: 本次响应用到的 provider 原生 effort 级别；遗留/非托管响应为 None。
+    #: 对应上游 ``providerThinkingLevel``。
+    provider_thinking_level: str | None = Field(default=None, alias="providerThinkingLevel")
     diagnostics: list[dict[str, Any]] | None = None
     usage: Usage = Field(default_factory=Usage)
     stop_reason: StopReason = Field(default="pending", alias="stopReason")
     error_message: str | None = Field(default=None, alias="errorMessage")
     raw_stop_reason: str | None = Field(default=None, alias="rawStopReason")
+    #: provider 是否显式结束了本轮（如 Codex end_turn）。仅用于调试，
+    #: 不影响 agent 控制流。仅类型对齐，本端未实现 Responses/Codex API。
+    end_turn: bool | None = Field(default=None, alias="endTurn")
     timestamp: int = 0
 
 
@@ -401,6 +423,9 @@ class SimpleStreamOptions(StreamOptions):
 
     reasoning: ThinkingLevel | None = None
     thinking_budgets: dict[str, int] | None = Field(default=None, alias="thinkingBudgets")
+    #: provider 中性的工具选择（"auto"/"none"）。省略时适配器使用
+    #: provider 私有行为。对应上游 ``SimpleStreamOptions.toolChoice``。
+    tool_choice: ToolChoice | None = Field(default=None, alias="toolChoice")
 
 
 __all__ = [
@@ -411,6 +436,8 @@ __all__ = [
     "ProviderId",
     "ThinkingLevel",
     "ModelThinkingLevel",
+    "ToolChoice",
+    "ThinkingTokenBudgetField",
     "CacheRetention",
     "Transport",
     "SessionAffinityFormat",

@@ -57,6 +57,8 @@ _RETRYABLE_PATTERNS = [
     "internal.?error",
     # wrapper/provider 瞬时上游故障
     "provider.?returned.?error",
+    # 上游请求缓冲区超限（provider 转发层重试上游时的瞬时失败）
+    "exceeded request buffer limit while retrying upstream",
     # 网络/代理/fetch 传输故障
     "network.?error",
     "connection.?error",

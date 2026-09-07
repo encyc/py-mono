@@ -541,3 +541,261 @@ async def test_openai_thinking_token_budget_skipped_without_compat(monkeypatch):
     await event_stream.result()
 
     assert "thinking_token_budget" not in capture
+
+
+# ============================================================
+# v0.85.1: reasoning_details（结构化 reasoning 回放）
+# ============================================================
+
+
+def _reasoning_details_chunk(details):
+    delta = SimpleNamespace(content=None, tool_calls=None, reasoning_details=details)
+    return _chunk(delta=delta)
+
+
+async def test_openai_reasoning_details_serialized_once(monkeypatch):
+    """reasoning_details 是回放元数据：流式期间不发 delta，块结束时一次性
+    序列化进 thinking 签名；连续同类增量合并、加密条目独立。"""
+    chunks = [
+        _reasoning_details_chunk([{"type": "reasoning.text", "text": "a"}]),
+        _reasoning_details_chunk([{"type": "reasoning.text", "text": "b"}]),
+        _reasoning_details_chunk([{"type": "reasoning.encrypted", "data": "enc"}]),
+        _chunk(finish_reason="stop"),
+    ]
+    events, _, message = await _collect_openai(monkeypatch, chunks)
+
+    thinking = [b for b in message.content if b.type == "thinking"]
+    assert len(thinking) == 1
+    assert thinking[0].thinking == ""  # 回放数据不进可见思考文本
+
+    import json
+
+    details = json.loads(thinking[0].thinking_signature)
+    assert details == [
+        {"type": "reasoning.text", "text": "ab"},
+        {"type": "reasoning.encrypted", "data": "enc"},
+    ]
+
+    # 不发 thinking_delta（回放元数据不是用户可见增量）
+    from pi_ai.events import ThinkingDeltaEvent
+
+    assert not any(isinstance(e, ThinkingDeltaEvent) for e in events)
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+
+
+async def test_openai_reasoning_details_invalid_entries_ignored(monkeypatch):
+    """非法 reasoning detail 条目被忽略。"""
+    chunks = [
+        _reasoning_details_chunk([{"type": "reasoning.unknown"}]),
+        _reasoning_details_chunk([{"type": "reasoning.summary", "summary": "s"}]),
+        _chunk(finish_reason="stop"),
+    ]
+    _, _, message = await _collect_openai(monkeypatch, chunks)
+
+    import json
+
+    thinking = [b for b in message.content if b.type == "thinking"]
+    assert len(thinking) == 1
+    assert json.loads(thinking[0].thinking_signature) == [
+        {"type": "reasoning.summary", "summary": "s"}
+    ]
+
+
+def test_convert_messages_replays_signed_reasoning_details():
+    """thinking 块签名携带的 reasoning_details 回放为 assistant 消息字段。"""
+    import json
+
+    from pi_ai import ThinkingContent
+
+    details = [{"type": "reasoning.text", "text": "ab"}]
+    context = Context(
+        messages=[
+            UserMessage(content="hi"),
+            AssistantMessage(
+                api="openai-completions",
+                provider="openai",
+                model="gpt-4o",
+                stop_reason="stop",
+                content=[
+                    ThinkingContent(thinking="", thinking_signature=json.dumps(details)),
+                    ToolCall(id="c1", name="t", arguments={}),
+                ],
+            ),
+        ]
+    )
+
+    messages, _ = _convert_messages(context)
+
+    assert messages[1]["reasoning_details"] == details
+
+
+def test_convert_messages_replays_legacy_encrypted_reasoning_detail():
+    """遗留：工具调用 thoughtSignature 中的加密条目回放为 reasoning_details。"""
+    import json
+
+    legacy = {"type": "reasoning.encrypted", "id": "r1", "data": "enc"}
+    context = Context(
+        messages=[
+            AssistantMessage(
+                api="openai-completions",
+                provider="openai",
+                model="gpt-4o",
+                stop_reason="stop",
+                content=[
+                    ToolCall(id="c1", name="t", arguments={}, thought_signature=json.dumps(legacy)),
+                ],
+            ),
+        ]
+    )
+
+    messages, _ = _convert_messages(context)
+
+    assert messages[0]["reasoning_details"] == [legacy]
+
+
+def test_convert_messages_no_reasoning_details_when_absent():
+    """无回放数据时不发 reasoning_details 字段。"""
+    context = Context(
+        messages=[
+            AssistantMessage(
+                api="openai-completions",
+                provider="openai",
+                model="gpt-4o",
+                stop_reason="stop",
+                content=[ToolCall(id="c1", name="t", arguments={})],
+            ),
+        ]
+    )
+
+    messages, _ = _convert_messages(context)
+
+    assert "reasoning_details" not in messages[0]
+
+
+# ============================================================
+# v0.85.1: thinkingTokenBudgetField / vllmPriority / toolChoice / usage
+# ============================================================
+
+
+async def test_openai_thinking_budget_field_generalized(monkeypatch):
+    """compat.thinkingTokenBudgetField 指定字段名（Qwen/SGLang 用 thinking_budget）。"""
+    capture: dict = {}
+    monkeypatch.setattr(
+        openai_provider,
+        "_create_client",
+        lambda model, api_key, headers, http_client=None: _capturing_openai_client(
+            [_chunk(finish_reason="stop")], capture
+        ),
+    )
+    model = _make_model()
+    model.reasoning = True
+    model.max_tokens = 32768
+    model.compat = {"thinkingTokenBudgetField": "thinking_budget"}
+
+    from pi_ai import SimpleStreamOptions
+
+    event_stream = openai_provider._run_openai_stream(
+        model,
+        Context(messages=[UserMessage(content="hi")]),
+        SimpleStreamOptions(api_key="test", reasoning="medium"),
+    )
+    async for _ in event_stream:
+        pass
+    await event_stream.result()
+
+    assert capture["thinking_budget"] == 8192
+    assert "thinking_token_budget" not in capture
+
+
+async def test_openai_thinking_budget_field_alias_compat(monkeypatch):
+    """遗留 supportsThinkingTokenBudget 等价于 thinking_token_budget。"""
+    capture: dict = {}
+    monkeypatch.setattr(
+        openai_provider,
+        "_create_client",
+        lambda model, api_key, headers, http_client=None: _capturing_openai_client(
+            [_chunk(finish_reason="stop")], capture
+        ),
+    )
+    model = _make_model()
+    model.reasoning = True
+    model.max_tokens = 32768
+    model.compat = {"supportsThinkingTokenBudget": True}
+
+    from pi_ai import SimpleStreamOptions
+
+    event_stream = openai_provider._run_openai_stream(
+        model,
+        Context(messages=[UserMessage(content="hi")]),
+        SimpleStreamOptions(api_key="test", reasoning="low"),
+    )
+    async for _ in event_stream:
+        pass
+    await event_stream.result()
+
+    assert capture["thinking_token_budget"] == 2048
+
+
+async def test_openai_vllm_priority_sent(monkeypatch):
+    """compat.vllmPriority 注入顶层 priority 字段。"""
+    capture: dict = {}
+    monkeypatch.setattr(
+        openai_provider,
+        "_create_client",
+        lambda model, api_key, headers, http_client=None: _capturing_openai_client(
+            [_chunk(finish_reason="stop")], capture
+        ),
+    )
+    model = _make_model()
+    model.compat = {"vllmPriority": -5}
+
+    event_stream = openai_provider._run_openai_stream(
+        model,
+        Context(messages=[UserMessage(content="hi")]),
+        StreamOptions(api_key="test"),
+    )
+    async for _ in event_stream:
+        pass
+    await event_stream.result()
+
+    assert capture["priority"] == -5
+
+
+async def test_openai_tool_choice_forwarded(monkeypatch):
+    """SimpleStreamOptions.tool_choice 透传为 tool_choice。"""
+    capture: dict = {}
+    monkeypatch.setattr(
+        openai_provider,
+        "_create_client",
+        lambda model, api_key, headers, http_client=None: _capturing_openai_client(
+            [_chunk(finish_reason="stop")], capture
+        ),
+    )
+
+    from pi_ai import SimpleStreamOptions
+
+    event_stream = openai_provider._run_openai_stream(
+        _make_model(),
+        Context(messages=[UserMessage(content="hi")]),
+        SimpleStreamOptions(api_key="test", tool_choice="none"),
+    )
+    async for _ in event_stream:
+        pass
+    await event_stream.result()
+
+    assert capture["tool_choice"] == "none"
+
+
+def test_usage_kimi_top_level_cached_tokens():
+    """Kimi 在最终 usage chunk 用顶层 cached_tokens 报缓存命中。"""
+    raw = SimpleNamespace(
+        prompt_tokens=100,
+        completion_tokens=20,
+        prompt_tokens_details=None,
+        cached_tokens=40,
+    )
+    usage = _parse_chunk_usage(raw, _make_model())
+
+    assert usage.cache_read == 40
+    assert usage.input == 60  # 100 - 40
+    assert usage.total_tokens == 120  # 60 + 40 + 20

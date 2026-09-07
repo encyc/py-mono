@@ -16,8 +16,8 @@
 
 from __future__ import annotations
 
-__version__ = "0.84.1"
-__upstream_ref__ = "earendil-works/pi@v0.84.1"
+__version__ = "0.85.1"
+__upstream_ref__ = "earendil-works/pi@v0.85.1"
 
 # ---- 类型 ----
 # ---- 事件流 ----
@@ -95,8 +95,10 @@ from .types import (
     TextContent,
     ThinkingContent,
     ThinkingLevel,
+    ThinkingTokenBudgetField,
     Tool,
     ToolCall,
+    ToolChoice,
     ToolResultContentBlock,
     ToolResultMessage,
     Usage,
@@ -104,6 +106,9 @@ from .types import (
     UserContentBlock,
     UserMessage,
 )
+
+# ---- User-Agent ----
+from .user_agent import get_pi_user_agent
 
 # 注册内置 provider（副作用，幂等）
 register_builtins()
@@ -135,8 +140,10 @@ __all__ = [
     "TextContent",
     "ThinkingContent",
     "ThinkingLevel",
+    "ThinkingTokenBudgetField",
     "Tool",
     "ToolCall",
+    "ToolChoice",
     "ToolResultContentBlock",
     "ToolResultMessage",
     "Usage",
@@ -190,4 +197,6 @@ __all__ = [
     "complete_simple",
     "stream",
     "stream_simple",
+    # User-Agent
+    "get_pi_user_agent",
 ]
